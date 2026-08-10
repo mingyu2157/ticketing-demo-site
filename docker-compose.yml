@@ -3,8 +3,9 @@ services:
     build:
       context: .
       args:
-        VLUR_API_BASE: ${VITE_VLUR_API_BASE:-http://localhost:8000}
-        VLUR_PUBLIC_SITE_KEY: ${VITE_VLUR_SITE_KEY:-pk-aicap_dev_testuser_001}
+        VLUR_API_BASE: https://vlur.site
+        VLUR_PUBLIC_SITE_KEY: pk-aicap_dev_testuser_002
+        VLUR_WIDGET_URL: https://vlur.site/static/widget/vlur-captcha.js
     ports:
       - "${APP_PORT:-5298}:80"
     restart: unless-stopped
