@@ -18,7 +18,7 @@
 ```
 
 - **경로 라우팅은 Ingress가 아니라 frontend nginx가 담당**합니다. `/api/v1/captcha/*`는 prefix를 유지한 채, 나머지 `/api/*`는 prefix를 떼고 백엔드로 넘기는 재작성 규칙([nginx/default.conf.template](../nginx/default.conf.template))이 이미 이미지 안에 있기 때문에, Ingress는 도메인 단위로만 나눕니다.
-- **AI 추론은 클러스터 안 파드**로 배포합니다(모델 ~5MB, CPU torch). 클러스터 밖 GPU-01로 전환하는 방법은 Phase 10에 별도로 있습니다.
+- **AI 추론은 클러스터 안 파드**로 배포하며 **CPU에서 돕니다**. 클러스터에 GPU 노드 풀(`team2-gpu`)이 있지만 현재 추론 코드는 GPU를 쓸 수 없습니다 — 자세한 이유와 대응은 Phase 10을 보세요.
 - 챌린지 상태는 DB(captchas 테이블)에 저장되므로 backend를 2 replica로 띄워도 검증이 깨지지 않습니다.
 
 ### 0-2. 배포 산출물 (이 저장소 `k8s/manifests/`)
@@ -29,6 +29,7 @@
 | `05-app-config.yaml` | 비민감 설정 ConfigMap (DB_HOST=mysql, AI_SERVICE_URL 등) |
 | `10-mysql.yaml` | MySQL StatefulSet + 헤드리스 Service + PVC 40Gi (이미지: vlur-database — 초기화 SQL 내장) |
 | `20-ai.yaml` | AI 추론 Deployment(×2) + Service |
+| `25-llm.yaml` | 챗봇용 vLLM Deployment + Service + 모델 캐시 PVC 50Gi (GPU 노드, Phase 11에서 별도 배포) |
 | `30-backend.yaml` | FastAPI Deployment(×2) + Service |
 | `40-frontend.yaml` | nginx 정적서빙+프록시 Deployment(×2) + Service |
 | `50-ticketing-demo.yaml` | 티켓팅 데모 Deployment(×1) + Service |
@@ -42,7 +43,8 @@
 
 | 토큰 | 들어갈 값 | 확인 방법 |
 |---|---|---|
-| `__GIT_SHA__` | CI가 이미지를 빌드한 AI-Captcha 커밋 전체 SHA | GitHub Actions 실행 로그 또는 `git rev-parse upstream/develop` |
+| `__GIT_SHA__` | backend·ai·frontend 이미지를 빌드한 커밋 전체 SHA | `git rev-parse upstream/develop` |
+| `__DB_GIT_SHA__` | **vlur-database 이미지**를 빌드한 커밋 전체 SHA (위와 다를 수 있음) | Actions의 `Database Image Build` 최근 실행 — Phase 2-2 |
 | `__DEMO_GIT_SHA__` | ticketing-demo-site 이미지의 커밋 SHA | 해당 저장소 Actions (Phase 2-3에서 만듦) |
 | `__STORAGE_CLASS__` | 블록 스토리지 StorageClass 이름 | `kubectl get sc` |
 | `__ACME_EMAIL__` | 인증서 만료 알림 받을 이메일 | — |
@@ -70,11 +72,48 @@ export KUBECONFIG=~/Downloads/kubeconfig-team2-cluster-prod.yaml   # 실제 경�
 **[확인]**
 
 ```bash
-kubectl get nodes        # 워커 노드 3대 STATUS=Ready
+kubectl get nodes        # 노드 4대(일반 3 + GPU 1)가 STATUS=Ready
 kubectl cluster-info     # 컨트롤 플레인 응답
 ```
 
-> 안 되면: kubeconfig 경로 오타 / 토큰 만료 / VPN·허용 IP 여부부터 점검.
+노드 이름은 노드 풀 이름이 아니라 `host-10-0-2-xx` 형태로 나옵니다. 어느 풀 소속인지는 Phase 3-0의 `-L` 옵션으로 확인합니다.
+
+> 안 되면 아래 순서로 점검하세요. 실제로 겪은 것들입니다.
+> - `dial tcp [::1]:8080: connect: connection refused` → kubeconfig가 안 잡힌 것. `~/.kube/config`에 있는지 확인
+> - `operation not permitted` → macOS가 Downloads 폴더를 보호 중. Finder로 파일을 홈 폴더로 옮긴 뒤 `~/.kube/config`로 이동
+> - `executable kic-iam-auth not found` → 카카오클라우드 인증 헬퍼 미설치(아래 참조)
+> - `yaml: line N: mapping values are not allowed` → kubeconfig 들여쓰기 오류. `env:`는 `command:`와 같은 열이어야 함
+
+**[참고] kic-iam-auth 설치 (macOS Apple Silicon)**
+
+카카오클라우드는 kubeconfig에 토큰을 넣지 않고, 이 헬퍼가 IAM에서 매번 토큰을 받아오는 방식입니다. 브라우저로 받으면 Gatekeeper 격리 속성이 붙어 막히므로 `curl`로 받는 편이 깔끔합니다.
+
+```bash
+mkdir -p ~/bin
+curl -fsSL -o ~/bin/kic-iam-auth \
+  "https://objectstorage.kr-central-2.kakaocloud.com/v1/c11fcba415bd4314b595db954e4d4422/public/docs/binaries-kic-iam-auth/Mac%20ARM_64%2064Bit/kic-iam-auth"
+chmod +x ~/bin/kic-iam-auth
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc
+```
+
+새 터미널을 연 뒤, `~/.kube/config`의 `env: null`을 IAM 액세스 키로 채웁니다(들여쓰기는 `command:`와 같은 6칸).
+
+```yaml
+      env:
+        - name: OS_AUTH_URL
+          value: https://iam.kakaocloud.com/identity/v3
+        - name: OS_AUTH_TYPE
+          value: v3applicationcredential
+        - name: OS_APPLICATION_CREDENTIAL_ID
+          value: <IAM 액세스 키 ID>
+        - name: OS_APPLICATION_CREDENTIAL_SECRET
+          value: <IAM 시크릿>
+        - name: OS_REGION_NAME
+          value: kr-central-2
+```
+
+> 액세스 키는 콘솔 IAM에서 새로 발급합니다. GitHub Secrets에 등록된 `KCR_*` 키는 **값을 다시 읽을 수 없어** 재사용할 수 없습니다.
+> 이 파일에는 시크릿이 평문으로 들어가니 `chmod 600 ~/.kube/config`를 유지하고 절대 커밋하지 마세요.
 
 ---
 
@@ -92,17 +131,44 @@ kubectl cluster-info     # 컨트롤 플레인 응답
 
 **[작업]** `kakao-NoBot/AI-Captcha` → Settings → Secrets and variables → Actions 에 `KCR_ACCESS_KEY_ID`, `KCR_SECRET_ACCESS_KEY` 가 등록되어 있는지 확인합니다. (CI가 최근에 성공한 적이 있으면 이미 등록된 것입니다.)
 
-### 2-2. 4개 이미지 빌드 실행
+### 2-2. 이미지 4개의 태그 확인
 
-**[작업]** 최신 develop 기준으로 이미지가 없다면, 각 워크플로우를 Actions 탭에서 **Run workflow(workflow_dispatch)** 로 수동 실행하거나, develop에 push가 일어나게 합니다. 세 워크플로우 모두 실행되어야 4개 이미지가 전부 만들어집니다.
+워크플로우는 3개인데 이미지는 4개입니다. `Backend + AI`가 두 개를 만들기 때문입니다.
 
-**[확인]** Actions 실행이 초록색인지 보고, **빌드된 커밋의 전체 SHA를 메모**합니다(태그가 `sha-<전체SHA>`). 로컬에서 확인하려면:
+| 워크플로우 | 만드는 이미지 | 쓰이는 placeholder |
+|---|---|---|
+| `Backend + AI Image Build` | `vlur-backend`, `vlur-ai` | `__GIT_SHA__` |
+| `Frontend Image Build` | `vlur-frontend` | `__GIT_SHA__` |
+| `Database Image Build` | `vlur-database` | `__DB_GIT_SHA__` |
+
+**`vlur-database`만 태그를 따로 관리합니다.** 이 워크플로우는 `database/` 폴더가 바뀔 때만 도는데, 그 폴더는 몇 주씩 안 바뀌는 게 정상이기 때문입니다. SQL 내용이 그대로면 옛 태그가 곧 최신이므로 **억지로 재빌드할 필요가 없습니다.**
+
+**[작업] 두 SHA를 확인해 메모합니다**
 
 ```bash
+# 1) backend·ai·frontend용 — develop HEAD
 git fetch upstream && git rev-parse upstream/develop
+
+# 2) 실제 빌드된 이미지들의 커밋 확인
+curl -sL "https://api.github.com/repos/kakao-NoBot/AI-Captcha/actions/runs?per_page=30" \
+  | python3 -c "
+import json,sys
+for r in json.load(sys.stdin)['workflow_runs']:
+    print(f\"{r['name'][:24]:26} {str(r.get('conclusion')):8} {r['head_sha']}\")"
 ```
 
-> 주의: 세 워크플로우가 서로 다른 커밋에서 돌았다면 이미지 태그도 제각각입니다. 헷갈리지 않게 **한 커밋에서 세 개를 모두 수동 실행**하는 걸 권장합니다.
+두 번째 출력에서 이렇게 읽습니다.
+
+- `Frontend Image Build`와 `Backend + AI Image Build`의 최신 성공 SHA → **`__GIT_SHA__`** (1번 결과와 같아야 정상) : 209f97dc3e912bd6683c4c83f4fca1e49ce50e86
+- `Database Image Build`의 최신 성공 SHA → **`__DB_GIT_SHA__`** : c03634e203a001db403fbf14acab0b6a17c2ccfd
+
+**[확인]** 두 SHA 모두 40자리 전체를 적어두세요. 태그는 `sha-` 뒤에 전체 SHA가 붙습니다.
+
+> **`Run workflow` 버튼이 안 보이는 이유**: GitHub은 워크플로우 파일이 **기본 브랜치(main)** 에 있을 때만 수동 실행 버튼을 노출합니다. 이 저장소의 워크플로우는 `develop`에만 있어서 세 개 모두 버튼이 없습니다. 그래서 이 가이드는 수동 실행이 아니라 **이미 빌드된 태그를 그대로 쓰는** 방식으로 진행합니다.
+>
+> 굳이 특정 이미지를 새로 빌드해야 한다면 해당 경로(`database/` 등)에 아무 변경이나 만들어 develop에 push하면 트리거됩니다. 앞으로 수동 실행을 쓰고 싶다면 워크플로우 파일들을 `main`에도 머지해 두세요.
+>
+> backend·ai·frontend는 배포 직전에 develop에 push가 일어나면 SHA가 또 달라집니다. 팀에 "develop 잠깐 멈춰달라"고 공지해두는 편이 안전합니다.
 
 ### 2-3. 티켓팅 데모 이미지 CI 추가
 
@@ -154,7 +220,39 @@ jobs:
 
 ---
 
-## Phase 3. 클러스터 기반 3종 — imagePullSecret · CSI · Ingress Controller(+cert-manager)
+## Phase 3. 클러스터 기반 — 노드 풀 · imagePullSecret · CSI · Ingress Controller(+cert-manager)
+
+### 3-0. 노드 풀 확인과 GPU 노드 격리 (중요)
+
+클러스터에 노드 풀이 둘 있습니다.
+
+| 노드 풀 | 인스턴스 | 용도 |
+|---|---|---|
+| `team2-node-pool2` | t1i.xlarge (일반 VM) | **이 서비스의 모든 파드가 여기서 돌아야 합니다** |
+| `team2-gpu` | gn1i.4xlarge (GPU) | 현재 이 서비스가 쓰지 않습니다 (Phase 10 참조) |
+
+**[작업]** GPU 노드에 taint가 걸려 있는지 확인합니다. taint가 없으면 스케줄러는 GPU 노드를 그냥 "자원 많은 노드"로 보기 때문에, **MySQL이나 프론트엔드 같은 파드가 비싼 GPU 노드에 올라가 버립니다.**
+
+```bash
+kubectl get nodes -L kakaocloud.com/node-pool-name    # 노드가 어느 풀 소속인지
+kubectl get nodes -o custom-columns='NODE:.metadata.name,TAINTS:.spec.taints'
+```
+
+- GPU 노드의 TAINTS에 `nvidia.com/gpu` 류의 `NoSchedule`이 이미 있으면 → **그대로 두고 3-1로 진행**합니다. 우리 파드는 toleration이 없으니 자동으로 일반 노드에만 올라갑니다.
+- TAINTS가 `<none>`이면 → 아래 명령으로 직접 격리합니다.
+
+```bash
+GPU_NODE=$(kubectl get nodes -l kakaocloud.com/node-pool-name=team2-gpu -o name | head -1)
+kubectl taint "$GPU_NODE" workload=gpu:NoSchedule
+```
+
+> taint 하나로 막는 방식을 택한 이유는, 매니페스트 5개에 각각 `nodeSelector`를 넣는 것보다 관리 지점이 하나뿐이고 나중에 파드를 추가해도 자동으로 적용되기 때문입니다. 되돌리려면 명령 끝에 `-` 를 붙입니다(`kubectl taint "$GPU_NODE" workload=gpu:NoSchedule-`).
+
+**[확인]** 배포를 끝낸 뒤(Phase 8 이후) 파드가 실제로 어디에 떴는지 봅니다.
+
+```bash
+kubectl -n captcha get pods -o wide    # NODE 열이 전부 team2-node-pool2 계열이어야 정상
+```
 
 ### 3-1. 레지스트리 pull 자격증명 (regcred)
 
@@ -326,7 +424,10 @@ kubectl -n captcha get secret app-secret -o jsonpath='{.data.GOOGLE_REDIRECT_URI
 cd k8s/manifests
 
 # macOS(BSD sed) 기준. Linux면 -i '' 대신 -i 만.
-sed -i '' "s/__GIT_SHA__/<Phase2에서 메모한 AI-Captcha 커밋 전체 SHA>/g" *.yaml
+# __DB_GIT_SHA__를 __GIT_SHA__보다 먼저 치환할 것 — 반대로 하면 __GIT_SHA__ 패턴이
+# __DB_GIT_SHA__ 안의 뒷부분과도 매치돼서 태그가 깨진다.
+sed -i '' "s/__DB_GIT_SHA__/<Database Image Build의 커밋 전체 SHA>/g" 10-mysql.yaml
+sed -i '' "s/__GIT_SHA__/<develop HEAD 커밋 전체 SHA>/g" *.yaml
 sed -i '' "s/__DEMO_GIT_SHA__/<데모 저장소 커밋 전체 SHA>/g" 50-ticketing-demo.yaml
 sed -i '' "s/__STORAGE_CLASS__/<Phase3-2의 StorageClass 이름>/g" *.yaml
 sed -i '' "s/__ACME_EMAIL__/<본인 이메일>/g" 65-cluster-issuer.yaml
@@ -507,34 +608,183 @@ kubectl -n captcha rollout history deploy/backend   # 리비전 확인
 
 ---
 
-## Phase 10. (옵션) AI를 클러스터 밖 GPU-01로 전환
+## Phase 10. 캡차 판별 AI는 GPU를 쓰지 않습니다
 
-추론 부하가 CPU 파드로 감당이 안 될 때만 필요합니다.
+클러스터에 GPU 노드 풀(`team2-gpu`, gn1i.4xlarge)이 있지만, **드래그 봇 판별 AI 파드는 GPU에 올리지 않습니다.** 코드가 GPU를 쓸 수 없는 구조이기 때문입니다. 배포 중에 "GPU를 왜 안 쓰지?"라는 질문이 나올 수 있어 근거를 남겨둡니다. GPU 노드는 대신 챗봇 LLM이 사용합니다(Phase 11).
+
+### 10-1. 왜 GPU를 쓸 수 없나
+
+서빙 경로의 추론이 **PyTorch가 아니라 NumPy로 구현**되어 있습니다.
+
+- [AI/ml/ensemble/](../AI/ml/ensemble/) 안의 `cnn_np_forward.py`, `bilstm_np_forward.py`가 실제 forward 연산을 담당하며, 이 파일들과 [AI/services/drag_classifier.py](../AI/services/drag_classifier.py)에는 `import torch`가 없습니다.
+- torch는 오직 체크포인트를 **읽을 때만** 쓰이고, 읽는 즉시 `.detach().cpu().numpy()`로 NumPy 배열로 변환됩니다([ensemble_predictor.py:99](../AI/ml/ensemble/ensemble_predictor.py#L99) `from_torch_checkpoint`, `map_location="cpu"` 고정).
+- [AI/Dockerfile](../AI/Dockerfile)도 CPU 전용 torch(`--index-url .../whl/cpu`)를 설치합니다.
+
+즉 GPU 노드에 파드를 올려도 **CUDA를 타는 연산이 한 줄도 없어서 속도가 그대로**입니다. 비싼 노드만 점유하게 됩니다.
+
+또 이 워크로드는 애초에 GPU가 필요한 규모가 아닙니다. 모델은 2.3MB이고, 입력은 드래그 궤적 한 건(63스텝 시퀀스)이라 CPU에서 밀리초 단위로 끝납니다. 백엔드의 호출 타임아웃도 3초로 넉넉합니다.
+
+### 10-2. 그래서 지금 할 일
+
+**GPU 노드를 격리해 두는 것**뿐입니다(Phase 3-0). 놔두면 MySQL이나 프론트엔드가 그 노드에 스케줄돼 자원만 낭비합니다.
+
+### 10-3. 나중에 GPU를 정말 쓰려면
+
+트래픽이 늘어 CPU 추론이 병목이 된다면 그때 아래 순서로 검토합니다. **코드 변경이 선행**되어야 하므로 배포 담당이 단독으로 결정할 일은 아닙니다.
+
+1. 추론을 torch forward로 다시 구현하고 `.to("cuda")` 경로를 넣기 (NumPy 구현과 결과가 일치하는지 회귀 테스트 필수 — 임계값 판정이 바뀌면 봇 탐지 정확도가 달라집니다)
+2. `AI/Dockerfile`의 torch를 CUDA 빌드로 교체
+3. 클러스터에 NVIDIA device plugin 설치 확인: `kubectl get pods -n kube-system | grep -i nvidia`
+4. `20-ai.yaml`에 GPU 요청과 toleration 추가:
+   ```yaml
+   resources:
+     limits:
+       nvidia.com/gpu: 1
+   tolerations:
+     - key: workload          # Phase 3-0에서 건 taint와 맞출 것
+       value: gpu
+       effect: NoSchedule
+   ```
+
+> 그 전까지는 **부하가 늘면 GPU가 아니라 `kubectl -n captcha scale deploy/ai --replicas=N` 으로 CPU 파드를 늘리는 게** 맞는 대응입니다. 무상태 서비스라 수평 확장이 그대로 먹힙니다.
+
+---
+
+## Phase 11. 챗봇 자체 호스팅 (GPU 노드 활용)
+
+챗봇을 OpenAI API 대신 **GPU 노드에서 돌리는 vLLM**으로 옮깁니다. 얻는 것은 API 비용 제거와 외부 의존 제거이고, 노는 GPU 노드가 여기서 쓰입니다.
+
+vLLM은 OpenAI와 **동일한 `/v1/chat/completions` 스키마**를 제공합니다. 그래서 [chatbot.py](../backend/routers/chatbot.py)의 호출 코드는 그대로 두고 주소만 바꿔 끼우는 구조로 만들어져 있습니다.
+
+> 이 Phase는 **서비스 배포(Phase 1~9)가 끝난 뒤 별도로** 진행해도 됩니다. 실패해도 `CHATBOT_API_URL`을 지우면 즉시 OpenAI로 돌아가므로(11-5), 서비스 오픈을 막지 않습니다.
+
+### 11-1. GPU 사용 가능 여부 확인
+
+**[작업]** GPU 자원이 스케줄러에 보이는지부터 봅니다.
+
+```bash
+# 1) 노드가 GPU를 자원으로 노출하는가
+kubectl get nodes -o custom-columns='NODE:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu'
+
+# 2) device plugin 파드가 떠 있는가
+kubectl get pods -n kube-system | grep -i nvidia
+```
+
+- GPU 열에 `1`이 보이면 → 11-2로 진행합니다. (이 클러스터는 GPU 1장 구성입니다 — 11-6의 제약을 함께 읽으세요.)
+- `<none>`이거나 device plugin이 없으면 → 카카오클라우드 콘솔의 GPU 노드 풀 안내에 따라 NVIDIA device plugin을 설치해야 합니다. **이게 없으면 `nvidia.com/gpu` 요청이 영원히 Pending입니다.**
+
+**[확인]** GPU 사양(특히 VRAM)을 직접 봅니다. 다음 단계의 모델 선택이 여기서 갈립니다.
+
+```bash
+kubectl run gpu-check --rm -it --restart=Never \
+  --image=nvidia/cuda:12.4.0-base-ubuntu22.04 \
+  --overrides='{"spec":{"tolerations":[{"key":"workload","value":"gpu","effect":"NoSchedule"}],"containers":[{"name":"gpu-check","image":"nvidia/cuda:12.4.0-base-ubuntu22.04","command":["nvidia-smi"],"resources":{"limits":{"nvidia.com/gpu":1}}}]}}'
+```
+
+### 11-2. 모델 선택
+
+`25-llm.yaml`의 기본값은 **Qwen2.5-7B-Instruct**입니다. 한국어 응대 품질이 준수하면서 단일 GPU에 올라가는 절충점입니다. 11-1에서 확인한 VRAM에 맞춰 조정하세요.
+
+| VRAM | 권장 `MODEL_ID` | 비고 |
+|---|---|---|
+| 24GB 이상 | `Qwen/Qwen2.5-7B-Instruct` | 기본값, 그대로 진행 |
+| 16GB 내외 | `Qwen/Qwen2.5-7B-Instruct` + `--gpu-memory-utilization=0.92`, `--max-model-len=2048` | 빠듯하면 아래로 |
+| 12GB 이하 | `Qwen/Qwen2.5-3B-Instruct` | 품질은 떨어지지만 FAQ 응대에는 충분 |
+
+이 챗봇은 고정된 시스템 프롬프트로 서비스 FAQ만 답하고 응답이 3~5문장으로 제한되어 있어, 모델 크기에 대한 요구가 높지 않습니다. **작은 모델부터 시작해 품질을 보고 올리는 편**이 안전합니다.
+
+### 11-3. 배포
 
 **[작업]**
-1. GPU-01(210.109.15.254)에서 AI 컨테이너 실행:
-   ```bash
-   docker run -d --name vlur-ai --restart unless-stopped -p 5000:5000 \
-     kc-sfacspace05.kr-central-2.kcr.dev/team2-repo/vlur-ai:sha-<SHA>
-   ```
-2. 보안 그룹: **워커 노드 대역 → GPU-01:5000** 인바운드 허용
-3. 백엔드가 바라보는 주소 교체:
-   ```bash
-   kubectl -n captcha patch configmap app-config \
-     -p '{"data":{"AI_SERVICE_URL":"http://210.109.15.254:5000"}}'
-   kubectl -n captcha rollout restart deploy/backend
-   ```
-4. 클러스터 안 AI 파드 정리: `kubectl -n captcha scale deploy/ai --replicas=0`
+
+```bash
+cd k8s/manifests
+sed -i '' "s/__STORAGE_CLASS__/<StorageClass 이름>/g" 25-llm.yaml   # 아직 안 했다면
+kubectl apply -f 25-llm.yaml
+kubectl -n captcha get pods -l app=llm -w
+```
+
+**최초 기동은 10~30분 걸립니다.** 모델 가중치 수 GB를 HuggingFace에서 받기 때문입니다. `startupProbe`를 30분까지 기다리도록 잡아뒀으니 그 사이 `Running`이지만 `READY 0/1`인 상태가 정상입니다. 진행 상황은 로그로 봅니다.
+
+```bash
+kubectl -n captcha logs -f deploy/llm
+```
+
+받은 가중치는 `llm-model-cache` PVC에 남으므로 **다음 재시작부터는 1~2분**이면 뜹니다.
 
 **[확인]**
 
 ```bash
-kubectl -n captcha exec deploy/backend -- python -c \
-  "import urllib.request; print(urllib.request.urlopen('http://210.109.15.254:5000/health', timeout=3).read())"
+kubectl -n captcha get pods -l app=llm      # READY 1/1
+kubectl -n captcha exec deploy/backend -- python -c "
+import json, urllib.request
+req = urllib.request.Request('http://llm:8000/v1/chat/completions',
+    data=json.dumps({'model':'vlur-chatbot','messages':[{'role':'user','content':'안녕하세요'}],'max_tokens':50}).encode(),
+    headers={'Content-Type':'application/json'})
+print(json.load(urllib.request.urlopen(req, timeout=60))['choices'][0]['message']['content'])"
 ```
 
-> 되돌리기: AI_SERVICE_URL을 `http://ai:5000`으로 patch → `scale deploy/ai --replicas=2` → backend restart.
-> GPU-01은 K8s 관리 밖이므로 장애 시 자동 복구가 없습니다 — `--restart unless-stopped` 필수, 점검 목록에 `docker ps` 추가.
+한국어 답변이 나오면 백엔드에서 LLM까지 경로가 뚫린 것입니다.
+
+### 11-4. 백엔드를 자체 호스팅으로 전환
+
+`05-app-config.yaml`에 `CHATBOT_API_URL`, `CHATBOT_MODEL`이 이미 들어 있습니다. Phase 5-3에서 apply했다면 백엔드를 재시작하기만 하면 됩니다.
+
+**[작업]**
+
+```bash
+kubectl apply -f 05-app-config.yaml       # 아직 반영 안 됐다면
+kubectl -n captcha rollout restart deploy/backend
+kubectl -n captcha rollout status deploy/backend
+```
+
+**[확인]** 실제 서비스 경로로 챗봇을 호출해 봅니다.
+
+```bash
+curl -s https://vlur.site/api/chatbot \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"요금제 알려주세요"}]}'
+```
+
+브라우저에서도 챗봇 위젯을 열어 **답변 내용이 서비스 정보(요금제, API Key 발급 등)와 맞는지** 확인하세요. 여기서 품질이 기대에 못 미치면 11-2의 더 큰 모델로 올리거나, 되돌리면 됩니다.
+
+### 11-5. 되돌리기 (OpenAI로 복귀)
+
+품질이 부족하거나 GPU 노드에 문제가 생기면 즉시 되돌릴 수 있습니다. `CHATBOT_API_URL`이 없으면 코드가 OpenAI 기본값으로 돌아가고, `app-secret`의 `OPENAI_API_KEY`를 다시 씁니다.
+
+```bash
+kubectl -n captcha patch configmap app-config \
+  --type=json -p='[{"op":"remove","path":"/data/CHATBOT_API_URL"},{"op":"remove","path":"/data/CHATBOT_MODEL"}]'
+kubectl -n captcha rollout restart deploy/backend
+```
+
+> 그래서 **`OPENAI_API_KEY`는 자체 호스팅으로 넘어간 뒤에도 `.env`에 남겨두세요.** 지우면 되돌릴 수단이 없어집니다.
+> GPU 노드를 정비할 일이 있으면 `kubectl -n captcha scale deploy/llm --replicas=0`으로 내렸다가 다시 올리면 됩니다.
+
+### 11-6. GPU가 1장이라는 제약 — 재학습과 시간을 나눠 씁니다
+
+이 클러스터의 GPU는 **1장**입니다. vLLM이 그 1장을 24시간 붙잡고 있으므로, 나중에 모델 재학습 Job이 GPU를 요청하면 **vLLM이 놓아줄 때까지 `Pending`에 걸립니다.** 두 작업을 동시에 돌릴 수 없습니다.
+
+재학습은 주 1회~월 1회면 충분한 작업이라, 새벽에 잠깐 교대하는 것으로 해결됩니다. 순서는 이렇습니다.
+
+```bash
+# 1) 챗봇을 OpenAI로 임시 전환 — 사용자는 차이를 느끼지 못한다
+kubectl -n captcha patch configmap app-config \
+  --type=json -p='[{"op":"remove","path":"/data/CHATBOT_API_URL"},{"op":"remove","path":"/data/CHATBOT_MODEL"}]'
+kubectl -n captcha rollout restart deploy/backend
+
+# 2) GPU 반납
+kubectl -n captcha scale deploy/llm --replicas=0
+
+# 3) 재학습 Job 실행 (학습 스크립트 확보 후 작성 예정)
+
+# 4) 학습이 끝나면 역순 복구
+kubectl -n captcha scale deploy/llm --replicas=1
+kubectl apply -f 05-app-config.yaml
+kubectl -n captcha rollout restart deploy/backend
+```
+
+> 이 4단계를 CronJob 하나로 묶으면 자동화됩니다. 학습이 도는 몇 시간만 OpenAI API를 쓰므로 비용도 미미합니다. **챗봇을 먼저 OpenAI로 돌려놓는 1번 단계를 빠뜨리면** 그 시간 동안 챗봇이 502를 냅니다.
 
 ---
 
@@ -552,7 +802,12 @@ kubectl -n captcha exec deploy/backend -- python -c \
 | 소셜 로그인 redirect_uri mismatch | 콘솔에 프로덕션 URI 미등록 | Phase 5-1의 콘솔 등록 목록 |
 | 데모 사이트 캡차 403/Origin 오류 | Site Key의 등록 도메인 ≠ ticket.vlur.site | Phase 8-4 |
 | mysql-0 재시작 후 데이터 정상, SQL 안 돔 | 정상 동작 (init은 빈 볼륨에서만) | 스키마 변경은 migrations로 |
-| 파드 Evicted/Pending (스케줄 불가) | 노드 리소스 부족 (3×4vCPU/8GB) | `kubectl top nodes`, replica·limits 조정 |
+| 파드 Evicted/Pending (스케줄 불가) | 일반 노드 풀 자원 부족 | `kubectl top nodes`, replica·limits 조정 |
+| 파드가 GPU 노드에 떠 있음 | GPU 노드에 taint 없음 | Phase 3-0의 taint 적용 후 `rollout restart` |
+| llm 파드가 계속 `Pending` | device plugin 없음 / taint·toleration 키 불일치 | Phase 11-1, `describe pod`의 Events |
+| llm이 `Running`인데 `READY 0/1` 지속 | 모델 다운로드 중 (최초 10~30분은 정상) | `logs -f deploy/llm`로 진행률 확인 |
+| llm `CrashLoopBackOff` (CUDA OOM) | 모델이 VRAM보다 큼 | Phase 11-2 표대로 모델·`max-model-len` 축소 |
+| 챗봇 503 "설정되지 않았습니다" | CHATBOT_API_URL 없고 OPENAI_API_KEY도 없음 | app-config 반영 후 `rollout restart deploy/backend` |
 | Let's Encrypt 발급 실패 반복 | 시간당 발급 한도(rate limit) 도달 | 1시간 대기, 그동안 staging issuer로 테스트 |
 
 ## 부록 B. 이번 배포에서 로컬(docker-compose)과 달라지는 점
@@ -563,7 +818,7 @@ kubectl -n captcha exec deploy/backend -- python -c \
 | DB 초기화 | `./database/init` 바인드 마운트 | vlur-database 이미지에 내장 |
 | 프론트 | Vite dev 서버(5173) | nginx 정적 서빙+프록시 (frontend/Dockerfile) |
 | API 진입 | `localhost:8000` 직접 | `https://vlur.site/api/*` → frontend nginx → backend |
-| AI 주소 | `http://ai:5000` | 동일 (Service 이름 유지) — GPU-01 전환 시만 변경 |
+| AI 주소 | `http://ai:5000` | 동일 (Service 이름 유지), CPU 추론도 동일 |
 | 환경변수 | `.env` 파일 | app-secret(전체) + app-config(토폴로지 값 override) |
 | HTTPS | 없음 | Ingress + cert-manager (Let's Encrypt 자동 갱신) |
 | 데이터 영속 | 도커 볼륨 | 블록 스토리지 PVC 40Gi + 백업 CronJob + 스냅샷 |
