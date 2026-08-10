@@ -1,0 +1,35 @@
+name: Ticketing Demo Image Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: kc-sfacspace05.kr-central-2.kcr.dev
+  IMAGE_NAME: team2-repo/vlur-ticketing-demo
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.KCR_ACCESS_KEY_ID }}
+          password: ${{ secrets.KCR_SECRET_ACCESS_KEY }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VLUR_API_BASE=https://vlur.site
+            VLUR_PUBLIC_SITE_KEY=pk-aicap_dev_testuser_001
+            VLUR_WIDGET_URL=https://vlur.site/static/widget/vlur-captcha.js
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
