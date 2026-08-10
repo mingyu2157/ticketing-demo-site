@@ -99,28 +99,83 @@ a { color: inherit; text-decoration: none; }
 }
 .tk-header-row {
   max-width: 1160px; margin: 0 auto; padding: 14px 24px;
-  display: flex; align-items: center; gap: 22px;
+  display: flex; align-items: center; gap: 22px; position: relative;
 }
-.tk-logo { display: flex; flex-direction: column; line-height: 1.05; cursor: pointer; }
+.tk-logo {
+  display: flex; flex: 0 0 auto; flex-direction: column; align-items: flex-start;
+  padding: 0; border: 0; background: none; line-height: 1.05; cursor: pointer;
+}
 .tk-logo b { font-size: 19px; font-weight: 800; color: var(--tk-primary); letter-spacing: -.02em; }
 .tk-logo span { font-size: 9px; font-weight: 700; letter-spacing: .18em; color: var(--tk-muted); }
 .tk-search {
-  flex: 1; display: flex; align-items: center; gap: 8px;
+  flex: 1; min-width: 180px; display: flex; align-items: center; gap: 8px;
   background: var(--tk-bg); border: 1px solid var(--tk-line); border-radius: 999px;
   padding: 9px 16px; color: var(--tk-muted); font-size: 13.5px; max-width: 420px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .tk-header-links { display: flex; align-items: center; gap: 16px; font-size: 13px; color: var(--tk-ink-soft); font-weight: 600; margin-left: auto; }
-.tk-header-links .tk-cart-badge {
+.tk-header-links a { white-space: nowrap; }
+.tk-cart-badge {
   display: inline-flex; align-items: center; justify-content: center;
   width: 16px; height: 16px; margin-left: 3px; border-radius: 50%;
   background: var(--tk-primary); color: #fff; font-size: 10px; font-weight: 700;
 }
+.tk-mobile-actions,
+.tk-mobile-menu { display: none; }
 .tk-subnav {
   border-top: 1px solid var(--tk-line); max-width: 1160px; margin: 0 auto; padding: 0 24px;
-  display: flex; gap: 22px; font-size: 13.5px; font-weight: 600; color: var(--tk-ink-soft);
+  display: flex; gap: 22px; overflow-x: auto; font-size: 13.5px; font-weight: 600; color: var(--tk-ink-soft);
+  scrollbar-width: none;
 }
-.tk-subnav a { padding: 11px 0; display: inline-block; }
+.tk-subnav::-webkit-scrollbar { display: none; }
+.tk-subnav a { flex: 0 0 auto; padding: 11px 0; display: inline-block; white-space: nowrap; }
 .tk-subnav a:hover { color: var(--tk-primary); }
+
+@media (max-width: 900px) {
+  .tk-header-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "logo actions"
+      "search search";
+    gap: 12px 16px;
+    padding: 12px 16px;
+  }
+  .tk-logo { grid-area: logo; width: max-content; }
+  .tk-logo b { font-size: 20px; }
+  .tk-search {
+    grid-area: search; width: 100%; max-width: none; min-width: 0;
+    padding: 10px 14px; font-size: 13px;
+  }
+  .tk-header-links { display: none; }
+  .tk-mobile-actions {
+    grid-area: actions; display: flex; align-items: center; gap: 12px;
+  }
+  .tk-mobile-cart {
+    display: inline-flex; align-items: center; color: var(--tk-ink-soft);
+    font-size: 12.5px; font-weight: 700; white-space: nowrap;
+  }
+  .tk-mobile-cart .tk-cart-badge { width: 18px; height: 18px; }
+  .tk-menu-button {
+    width: 36px; height: 36px; padding: 9px; border: 1px solid var(--tk-line);
+    border-radius: 10px; background: var(--tk-card); cursor: pointer;
+    display: flex; flex-direction: column; align-items: stretch; justify-content: center; gap: 4px;
+  }
+  .tk-menu-button span { display: block; height: 2px; border-radius: 999px; background: var(--tk-ink-soft); }
+  .tk-mobile-menu {
+    position: absolute; top: 58px; right: 16px; z-index: 2;
+    width: 168px; padding: 8px; border: 1px solid var(--tk-line); border-radius: 14px;
+    background: var(--tk-card); box-shadow: 0 16px 36px -16px rgba(28,24,48,.35);
+  }
+  .tk-mobile-menu.is-open { display: grid; }
+  .tk-mobile-menu a {
+    padding: 10px 12px; border-radius: 9px; color: var(--tk-ink-soft);
+    font-size: 13px; font-weight: 700; white-space: nowrap;
+  }
+  .tk-mobile-menu a:hover { background: var(--tk-bg); color: var(--tk-primary); }
+  .tk-subnav { gap: 24px; padding: 0 16px; }
+  .tk-subnav a { padding: 10px 0; font-size: 13px; }
+}
 
 /* ── Layout wrap ── */
 .tk-wrap { max-width: 1160px; margin: 0 auto; padding: 28px 24px 64px; width: 100%; }

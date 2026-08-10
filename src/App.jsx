@@ -15,16 +15,7 @@ export default function App() {
   const isCaptchaTestPath = pathname === '/captcha-test';
 
   if (isCaptchaTestPath) {
-    if (import.meta.env.DEV) {
-      return <CaptchaTestPage />;
-    }
-
-    return (
-      <main className="tk-route-blocked">
-        <h1>404</h1>
-        <p>요청한 페이지를 찾을 수 없습니다.</p>
-      </main>
-    );
+    return <CaptchaTestPage />;
   }
 
   return <TicketingApp />;
